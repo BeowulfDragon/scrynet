@@ -1,0 +1,12 @@
+{application, scrynet_ingest,
+ [{description, "Scrynet stream ingestion"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {scrynet_ingest_app, []}},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []}
+ ]}.

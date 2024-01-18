@@ -1,10 +1,17 @@
--module(scrynet_rtmp_handler).
+%%%-------------------------------------------------------------------
+%% @doc RTMP Connection Handler.
+%% Takes over a connection once the RTMP handshake is performed.
+%% Handles the connection and sends completed chunks to a some other process.
+%% @end
+%%%-------------------------------------------------------------------
+-module(scrynet_rtmp_connection).
 -behaviour(gen_server).
 
 -include("handshake_info.hrl").
-%% API
--export([start_and_transfer/1, start_link/0, give_socket/2]).
+
+-export([start_and_transfer/2, start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export_type([connection_worker_ref/0]).
 
 -record(chunk_stream, {
             length :: integer(),
@@ -16,35 +23,51 @@
     }).
 
 -record(state, {socket :: gen_tcp:socket(),
-                ownership :: boolean(),
+                ownership = false :: boolean(),
                 chunk_streams = #{} :: #{integer() := #chunk_stream{}},
-                finished_message :: fun(),
                 server_epoch :: integer(),
                 client_epoch :: integer(),
-                send_max_chunk_size = 128,
-                recieve_max_chunk_size = 128,
-                recieve_window_acknowledgement_size :: integer(),
-                recieved_sequence = 0,
-                recieved_since_last_ack = 0,
-                recieve_last_limit :: soft | hard, % Last limit type set for the peer by here
-                send_window_acknowledgement_size :: integer(),
+                send_max_chunk_size = 128 :: non_neg_integer(),
+                recieve_max_chunk_size = 128 :: non_neg_integer(),
+                recieve_window_acknowledgement_size = 0 :: non_neg_integer(),
+                recieved_sequence = 0 :: non_neg_integer(),
+                recieved_since_last_ack = 0 :: non_neg_integer(),
+                recieve_last_limit = soft :: soft | hard, % Last limit type set for the peer by here
+                send_window_acknowledgement_size = 0 :: integer(),
                 sent_sequence = 0,
                 sent_since_last_ack = 0,
-                send_last_limit :: soft | hard}). % Last limit type set by the peer for here
+                send_last_limit = soft :: soft | hard, % Last limit type set by the peer for here
+                handler_module :: atom(),
+                handler_state = {} :: term()}).
 
 -record(basic_header, {format :: 0 | 1 | 2 | 3, csid :: 0..65599}).
 -type basic_header() :: #basic_header{}.
 
 -type chunk_header() :: #{time := integer(), length => 0..16777215, type => 0..255, stream_id => 0..4294967295}.
 
--spec give_socket(Socket :: gen_tcp:socket(), Pid :: pid()) -> ok.
-give_socket(Socket, Pid) ->
-    gen_tcp:controlling_process(Socket, Pid),
-    gen_server:cast().
+-opaque connection_worker_ref() :: {pid()}.
 
--spec start_and_transfer(HandshakeInfo :: #handshake_info{}) -> supervisor:startchild_ret().
-start_and_transfer(HandshakeInfo) ->
-    Ret = scrynet_rtmp_handler_sup:start_child(HandshakeInfo),
+%%% API
+
+%% @doc Set the bandwidth limit with a reference to a worker.
+%% For use outside the module.
+%% @param Ref Reference to the worker process.
+%% @param Size The bandwidth limit to set in bytes.
+%% @param Type The type of bandwidth limit to set.
+%% @returns The atom ok, as this is a wrapper around a cast.
+-spec set_peer_bandwidth(Ref :: connection_worker_ref(), Size :: non_neg_integer(), Type :: soft | hard | dynamic) -> ok.
+set_peer_bandwidth(Ref, Size, Type) ->
+    Pid = get_worker_pid(Ref),
+    gen_server:cast(Pid, {set_peer_bandwidth, Size, Type}).
+
+%% @doc Start a connection worker and transfer owner of the socket to it.
+%% Just localizes this part here.
+%% @param HandshakeInfo The information pertaining to the handshake process.
+%% @param HandlerMod The module that contains functions for handling the connection.
+%% @returns a supervisor:startchild_ret().
+-spec start_and_transfer(HandshakeInfo :: #handshake_info{}, HandlerMod :: atom()) -> supervisor:startchild_ret().
+start_and_transfer(HandshakeInfo, HandlerMod) ->
+    Ret = scrynet_rtmp_connection_sup:start_child(HandshakeInfo, HandlerMod),
     case Ret of 
         {ok, Child} when is_pid(Child) -> % Guard is not really needed
             ok = gen_tcp:controlling_process(HandshakeInfo#handshake_info.socket, Child),
@@ -56,27 +79,19 @@ start_and_transfer(HandshakeInfo) ->
             Ret
     end.
 
--spec start_handler(HandshakeInfo :: #handshake_info{}) -> supervisor:startchild_ret().
-start_handler(HandshakeInfo) ->
-    scrynet_rtmp_handler_sup:start_child(HandshakeInfo).
+%%% Internal
 
-start_link(HandshakeInfo, OnConnect) ->
-    gen_server:start_link(?MODULE, {HandshakeInfo, OnConnect}, []).
+start_link(HandlerMod, HandshakeInfo) ->
+    gen_server:start_link(?MODULE, {HandlerMod, HandshakeInfo}, []).
 
-init({HandshakeInfo, OnConnect}) ->
-    OnFinished = OnConnect(HandshakeInfo),
+init({HandlerMod, HandshakeInfo}) ->
     State = #state{
         socket = HandshakeInfo#handshake_info.socket,
-        ownership = false,
-        finished_message = OnFinished,
         server_epoch = HandshakeInfo#handshake_info.server_epoch,
         client_epoch = HandshakeInfo#handshake_info.client_epoch,
-        recieve_window_acknowledgement_size
+        handler_module = HandlerMod
     },
     {ok, State}.
-
-send_message(Message, HandlerPID) -> 
-    gen_server:cast(HandlerPID, {send, Message}).
 
 handle_call(stop, _From, State) ->
     {stop, normal, stopped, State};
@@ -84,9 +99,36 @@ handle_call(stop, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
-handle_cast(ownership, State) ->
-    inet:setopts(State#state.socket, {active, once}),
+handle_cast(ownership, State) -> % Ownership of socket recieved
+    inet:setopts(State#state.socket, {active, false}),
+    gen_server:cast(self(), handler_init),
+    gen_server:cast(self(), connection_init_finish),
     {noreply, State};
+
+handle_cast(handler_init, State) ->
+    HandlerMod = State#state.handler_module,
+    ConnectionRef = create_connection_ref(),
+    HandlerState0 = HandlerMod:init(ConnectionRef),
+    case HandlerState0 of
+        {ok, HandlerState} ->
+            {noreply, State#state{handler_state = HandlerState}};
+        {error, Reason} ->
+            {stop, {handler, HandlerMod, Reason}, State}
+    end;
+
+handle_cast(connection_init_finish, State0) ->
+    Timestamp0 = erlang:system_time(millisecond) - State0#state.server_epoch,
+    ok = send_window_size(State0#state.socket, Timestamp0, 512),
+    Timestamp1 = erlang:system_time(millisecond) - State0#state.server_epoch,
+    ok = send_peer_bandwidth(State0#state.socket, Timestamp1, 512, soft),
+
+    inet:setopts(State0#state.socket, {active, once}),
+    ok;
+
+handle_cast({set_peer_bandwidth, Size, LimitType}, State0) ->
+    Timestamp = erlang:system_time(millisecond) - State0#state.server_epoch,
+    ok = send_peer_bandwidth(State0#state.socket, Timestamp, Size, LimitType),
+    {noreply, State0#state{recieve_window_acknowledgement_size = Size}};
 
 handle_cast({send, Message}, State) ->
     {noreply, State}.
@@ -94,26 +136,8 @@ handle_cast({send, Message}, State) ->
 handle_info({tcp, Socket, Data}, State0) ->
     %% Basic Header
     {#basic_header{format = Fmt, csid = CSID} = BasicHeader, Rest0} = unpack_basic_header(Data),
+
     %%% Chunk Message Header
-    %% Pattern match header type and update map of chunk streams if needed
-    %{NewStreams, HeaderInfo, Rest1} = case BasicHeader#basic_header.format of
-    %    0 ->
-    %        <<Timestamp:24/integer, Length:24/integer, TypeID:8/integer, StreamID:32/little-integer, ChunkRest/binary>> = Rest1,
-    %        HeaderData = #{delta => Timestamp, length => Length, type => TypeID, stream_id => StreamID},
-    %        UpdatedStreams = update_chunk_streams(State0#state.chunk_streams, CSID, HeaderData),
-    %        {UpdatedStreams, HeaderData, ChunkRest};
-    %    1 ->
-    %        <<TimestampDelta:24/integer, Length:24/integer, TypeID:8/integer, ChunkRest/binary>> = Rest1,
-    %        HeaderData = #{delta => TimestampDelta, length => Length, type => TypeID},
-    %        UpdatedStreams = update_chunk_streams(State0#state.chunk_streams, CSID, HeaderData),
-    %        {UpdatedStreams, HeaderData, ChunkRest};
-    %    2 ->
-    %        <<TimestampDelta:24/integer, ChunkRest/binary>> = Rest1,
-    %        HeaderData = #{delta => TimestampDelta},
-    %        {State0#state.chunk_streams, HeaderData, ChunkRest};
-    %    3 ->
-    %        {State0#state.chunk_streams, #{}, Rest1} % TODO: Extended timestamps (5.3.1.3)
-    %end,
     if
         is_map_key(CSID, State0#state.chunk_streams) ->
             #chunk_stream{extended_timestamp = Extended} = map_get(CSID, State0#state.chunk_streams);
@@ -158,14 +182,19 @@ handle_info({tcp, Socket, Data}, State0) ->
                     State0#state{recieve_window_acknowledgement_size = WindowSize};
                 6 -> % Set Peer Bandwidth (5.4.5)
                     <<WindowSize:32/integer, LimitType:8/integer>> = Rest1,
+                    LastWindowSize = State0#state.send_window_acknowledgement_size,
+                    Timestamp = erlang:system_time(millisecond) - State0#state.server_epoch,
                     case LimitType of
                         0 -> % Hard
+                            send_window_size(State0#state.socket, Timestamp, State0#state.recieve_window_acknowledgement_size),
                             State0#state{send_window_acknowledgement_size = WindowSize, send_last_limit = hard};
-                        1 when WindowSize < State0#state.recieve_window_acknowledgement_size -> % Soft, smaller
+                        1 when WindowSize < LastWindowSize -> % Soft, smaller
+                            send_window_size(State0#state.socket, Timestamp, State0#state.recieve_window_acknowledgement_size),
                             State0#state{send_window_acknowledgement_size = WindowSize, send_last_limit = soft};
                         1 -> % Soft, no effect
                             State0#state{send_last_limit = soft};
                         2 when State0#state.send_last_limit =:= 0 -> % Dynamic, last was Hard
+                            send_window_size(State0#state.socket, Timestamp, State0#state.recieve_window_acknowledgement_size),
                             State0#state{send_window_acknowledgement_size = WindowSize, send_last_limit = hard};
                         2 -> % Dynamic, ignore
                             State0
@@ -185,25 +214,28 @@ handle_info({tcp, Socket, Data}, State0) ->
             DataSize = byte_size(NewData),
             CurWindowFill = if 
                                 WindowFill =:= State0#state.recieve_window_acknowledgement_size -> % Send an ack if one is due
-                                    AckMsg = create_acknowledgement_message(CurrentSequence, State0#state.server_epoch),
-                                    gen_tcp:send(Socket, AckMsg),
+                                    Timestamp = erlang:system_time(millisecond) - State0#state.server_epoch,
+                                    send_acknowledgement(State0#state.socket, Timestamp, CurrentSequence),
                                     0; % Reset window sequence tracking
                                 WindowFill > State0#state.recieve_window_acknowledgement_size ->
-                                    throw({chunk_error, overfilled_window, State0#state.recieve_window_acknowledgement_size, WindowFill});
+                                    throw({chunk_error, overfilled_window,
+                                        State0#state.recieve_window_acknowledgement_size, WindowFill});
                                 true ->
                                     WindowFill
                             end,
             if
                 DataSize =:= StreamInfo#chunk_stream.length ->
-                    Finished = State0#state.finished_message,
-                    Finished(NewData),
+                    HandlerMod = State0#state.handler_module,
+                    NewHandlerState = HandlerMod:recieve(NewData, State0#state.handler_state),
                     NewStreamInfo = StreamInfo#chunk_stream{recieved_data = <<>>, extended_timestamp = NewExtended},
                     NewChunkStreams = UpdatedStreams#{CSID := NewStreamInfo},
-                    State0#state{chunk_streams = NewChunkStreams, recieved_sequence = CurrentSequence, recieved_since_last_ack = CurWindowFill};
+                    State0#state{chunk_streams = NewChunkStreams, recieved_sequence = CurrentSequence,
+                        recieved_since_last_ack = CurWindowFill, handler_state = NewHandlerState};
                 DataSize < StreamInfo#chunk_stream.length ->
                     NewStreamInfo = StreamInfo#chunk_stream{recieved_data = NewData, extended_timestamp = NewExtended},
                     NewChunkStreams = UpdatedStreams#{CSID := NewStreamInfo},
-                    State0#state{chunk_streams = NewChunkStreams, recieved_sequence = CurrentSequence, recieved_since_last_ack = CurWindowFill};
+                    State0#state{chunk_streams = NewChunkStreams, recieved_sequence = CurrentSequence,
+                        recieved_since_last_ack = CurWindowFill};
                 true ->
                     throw({chunk_error, size, StreamInfo#chunk_stream.length, DataSize})
             end;
@@ -293,23 +325,78 @@ update_chunk_streams(Streams, CSID, #{length := Length, type := TypeID} = _Heade
 update_chunk_streams(Streams, _CSID, Map) when is_map_key(length, Map) == false ->
     Streams.
 
-%% @doc Create a protocl control message type 3 acknowledgement.
-%% Pack a sequence number and current server time into a window acknowledgement message.
-%% @param SequenceNumber The current sequence number for recieved messages.
-%% @param Epoch The server-side epoch for this connection (we are the server).
-%% @returns A binary to be sent as an acknowledgement message.
--spec create_acknowledgement_message(SequenceNumber :: integer(), Epoch :: integer()) -> binary().
-create_acknowledgement_message(SequenceNumber, Epoch) ->
-    Time = erlang:system_time(millisecond) - Epoch,
-    % Format, CSID, timestamp, length, type ID, stream ID, (extended timestamp), sequence number
-    if 
-        Time >= 16#FFFFFF -> 
-            <<0:2/integer, 2:6/integer, 16#FFFFFF:24/integer, 32:32/integer, 3:8/integer, 0:32/integer, Time:32/integer, SequenceNumber:32/integer >>;
-        true -> 
-            <<0:2/integer, 2:6/integer, Time:24/integer, 32:32/integer, 3:8/integer, 0:32/integer, SequenceNumber:32/integer>>
-    end.
+%% @doc Create the opaque record used to locate this worker for the purposes of sending messages
+%% Called before sending it to the handler.
+%% @returns The opaque record used to refer to the calling worker.
+-spec create_connection_ref() -> connection_worker_ref().
+create_connection_ref() ->
+    {self()}.
 
-terminate(_Reason, _State) ->
+%% @doc Get the PID from a connection_worker_ref() record.
+%% The record is opaque, and ideally any users of the API shouldn't even try to get the Pid, but we need a way to get it, ideally in just one place.
+%% @param Ref The connection worker reference.
+%% @returns The pid for the connection worker.
+-spec get_worker_pid(Ref :: connection_worker_ref()) -> pid().
+get_worker_pid({Pid}) ->
+    Pid.
+
+%% @doc Set the bandwidth limit.
+%% @param Socket Socket to send the message on.
+%% @param Time The current time offset from the Epoch.
+%% @param Size The limit to set.
+%% @param LimitType The type of limit to set
+%% @returns The return types from gen_tcp:send/2.
+-spec send_peer_bandwidth(Socket :: gen_tcp:socket(), Time :: non_neg_integer(), Size :: 1..16#FFFFFFFF, LimitType :: soft | hard | dynamic) -> ok | {error, closed | {timeout, binary()}, inet:posix()}.
+send_peer_bandwidth(Socket, Time, Size, LimitType) ->
+    BasicHeader = <<0:2/integer, 2:6/integer>>,
+    MessageHeader0 = <<5:24/integer, 6:8/integer, 0:32/integer>>,
+    MessageHeader = if
+        Time >= 16#FFFFFF -> <<16#FFFFFF:24/integer, MessageHeader0/binary, Time:32/integer>>;
+        true -> <<Time:24/integer, MessageHeader0/binary>>
+        end,
+    TypeBinary = case LimitType of
+        hard -> <<0:8/integer>>;
+        soft -> <<1:8/integer>>;
+        dynamic -> <<2:8/integer>>
+    end,
+    Message = <<BasicHeader/binary, MessageHeader/binary, Size:32/integer, TypeBinary/binary>>,
+    gen_tcp:send(Socket, Message).
+
+%% @doc Set the window size.
+%% @param Socket The socket to send the message with.
+%% @param Time The time since the server epoch.
+%% @param Size The size to set the window to.
+%% @returns The return types from gen_tcp:send/2.
+-spec send_window_size(Socket :: gen_tcp:socket(), Time :: non_neg_integer(), Size :: 1..16#FFFFFFFF) -> ok | {error, closed | {timeout, binary()}, inet:posix()}.
+send_window_size(Socket, Time, Size) ->
+    BasicHeader = <<0:2/integer, 2:6/integer>>,
+    MessageHeader0 = <<4:24/integer, 5:8/integer, 0:32/integer>>,
+    MessageHeader = if
+        Time >= 16#FFFFFF -> <<16#FFFFFF:24/integer, MessageHeader0/binary, Time:32/integer>>;
+        true -> <<Time:24/integer, MessageHeader0/binary>>
+        end,
+    Message = <<BasicHeader/binary, MessageHeader/binary, Size:32/integer>>,
+    gen_tcp:send(Socket, Message).
+
+%% @doc Send an acknowledgement message.
+%% @param Socket The socket to send the message with.
+%% @param Time The time since the server epoch.
+%% @param SequenceNumber The sequence number to send the acknowledgement for.
+%% @returns The return types from gen_tcp:send/2.
+-spec send_acknowledgement(Socket :: gen_tcp:socket(), Time :: non_neg_integer(), SequenceNumber :: 1..16#FFFFFFFF) -> ok | {error, closed | {timeout, binary()}, inet:posix()}.
+send_acknowledgement(Socket, Time, SequenceNumber) ->
+    BasicHeader = <<0:2/integer, 2:6/integer>>,
+    MessageHeader0 = <<4:24/integer, 3:8/integer, 0:32/integer>>,
+    MessageHeader = if
+        Time >= 16#FFFFFF -> <<16#FFFFFF:24/integer, MessageHeader0/binary, Time:32/integer>>;
+        true -> <<Time:24/integer, MessageHeader0/binary>>
+        end,
+    Message = <<BasicHeader/binary, MessageHeader/binary, SequenceNumber:32/integer>>,
+    gen_tcp:send(Socket, Message).
+
+%% todo: handle termation reasons
+terminate(_Reason, State) ->
+    gen_tcp:close(State#state.socket),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->

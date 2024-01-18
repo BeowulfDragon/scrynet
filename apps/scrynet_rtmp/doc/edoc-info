@@ -1,0 +1,5 @@
+%% encoding: UTF-8
+{application,scrynet_rtmp}.
+{modules,[amf0,amf3,scrynet_rtmp,scrynet_rtmp_acceptor,
+          scrynet_rtmp_acceptor_sup,scrynet_rtmp_app,scrynet_rtmp_connection,
+          scrynet_rtmp_connection_sup,scrynet_rtmp_sup]}.

@@ -1,0 +1,12 @@
+{application, scrynet_rtmp,
+    [{description, "RTMP connection server"},
+     {vsn, "0.1.0"},
+     {registered, []},
+     {mod, {scrynet_rtmp_app, []}},
+     {applications,
+         [kernel,
+          stdlib
+      ]},
+     {env,[]},
+     {modules, []}
+ ]}.

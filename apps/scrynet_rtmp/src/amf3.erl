@@ -1,4 +1,7 @@
-
+%%%-------------------------------------------------------------------
+%% @doc AMF3 Decoder.
+%% @end
+%%%-------------------------------------------------------------------
 -module(amf3).
 
 -record(amf3_index, {
@@ -6,13 +9,13 @@
     complex_objects :: list(),
     object_traits :: list()
     }).
+-type amf3_index() :: #amf3_index{}.
 
 -record(amf3_array, {
     associative = #{} :: map(),
     dense = [] :: list()
     }).
-
--type amf3_index() :: #amf3_index{}.
+-type amf3_array() :: #amf3_array{}.
 
 -spec new_amf3_index() -> amf3_index().
 new_amf3_index() ->
@@ -44,6 +47,7 @@ add_amf3_reference(trait, Value, Index) ->
 decode_amf3() ->
     ok.
 
+-spec decode_amf3_u29(Data :: binary()) -> {integer(), binary()}.
 decode_amf3_u29(<<0:1/integer, Number:7/integer, Rest/binary>>) ->
     {Number, Rest};
 
@@ -60,6 +64,7 @@ decode_amf3_u29(<<1:1/integer, Number1:7/integer, 1:1/integer, Number2:7/integer
     {Value, Rest}.
 
 %% For the integer type, the U29 is actually *signed*. So it's not actually U29 is it?
+-spec decode_amf3_i29(Data :: binary()) -> {integer(), binary()}.
 decode_amf3_i29(<<0:1/integer, Number:7/signed-integer, Rest/binary>>) ->
     {Number, Rest};
 
@@ -75,6 +80,7 @@ decode_amf3_i29(<<1:1/integer, Number1:7/integer, 1:1/integer, Number2:7/integer
     <<Value:29/signed-integer>> = <<Number1/bits, Number2/bits, Number3/bits>>,
     {Value, Rest}.
 
+-spec decode_amf3_value(Data :: binary(), Index :: amf3_index()) -> {term(), amf3_index(), binary()}.
 %% Undefined (0x00)
 decode_amf3_value(<<16#00:8/integer, Rest/binary>>, Index) ->
     {undefined, Index, Rest};
@@ -169,7 +175,7 @@ decode_amf3_value(<<16#0A:8/integer, Rest0/binary>>, Index0) ->
             RealLengthRef = LengthRef bsr 1,
             Traits = get_amf3_reference(trait, RealLengthRef, Index0),
             decode_amf3_object_values(Traits, Rest1, Index0); % This returns {Value, Rest, Index}
-        (U29VR rem 8) =:= 2#111 -> % U29O-traits-ext. This is for something with an "indeterminable number of bytes", so TODO
+        (U29VR rem 8) =:= 2#111 -> % U29O-traits-ext. (De)serialization is based on a classname and related logic that is already posessed by both client and server.
             % If I had to do this, it'd probably be with a hashmap with keys being the class-name and values being functions which decode what's needed.
             throw({amf3_decoding_error, u29o-traits-ext});
         true -> % U29O-traits, not dynamic, which means class-name, list of trait names (or string references), followed by trait values
@@ -355,9 +361,11 @@ decode_amf3_value(<<16#11:8/integer, Rest0/binary>>, Index0) ->
             {Value, Index2, Rest3}
     end.
 
+-spec decode_amf3_array(Size :: non_neg_integer(), Data :: binary(), Index :: amf3_index()) -> {amf3_array(), binary(), amf3_index()}.
 decode_amf3_array(Size, Data, Index) when Size > 0 ->
     decode_amf3_array(assoc, Size, Data, Index, #amf3_array{}).
 
+-spec decode_amf3_array(Phase :: assoc | dense, Size :: integer(), Data :: binary(), Index :: amf3_index(), Accumulator :: amf3_array()) -> {amf3_array(), binary(), amf3_index()}.
 decode_amf3_array(assoc, Size, <<16#0101:16/integer, Rest/binary>>, Index, Acc0) ->
     decode_amf3_array(strict, Size, Rest, Index, Acc0);
 
@@ -386,6 +394,7 @@ decode_amf3_array(dense, Size, Data, Index0, Acc0) when Size > 0 ->
     Acc = Acc0#amf3_array{dense = [Value] ++ Acc0#amf3_array.dense},
     decode_amf3_array(dense, Size - 1, Rest, Index1, Acc).
 
+-spec decode_amf3_object_values(Traits :: list(binary()), Data :: binary(), Index :: amf3_index()) -> {#{binary() := term()}, binary(), amf3_index()}.
 decode_amf3_object_values(Traits, Data, Index) ->
     lists:foldl(fun(Trait, Acc) ->
         {Object, Rest0, Index0} = Acc,
@@ -394,9 +403,11 @@ decode_amf3_object_values(Traits, Data, Index) ->
         {NewObject, Rest1, Index1}
         end, {#{}, Data, Index}, Traits).
 
+-spec decode_amf3_object_traits(Size :: non_neg_integer(), Data :: binary(), Index :: amf3_index()) -> {list(binary()), binary(), amf3_index()}.
 decode_amf3_object_traits(Size, Data, Index) when Size > 0 ->
     decode_amf3_object_traits(Size, Data, Index, []).
 
+-spec decode_amf3_object_traits(Size :: non_neg_integer(), Data :: binary(), Index :: amf3_index(), Accumulator :: list(binary())) -> {list(binary()), binary(), amf3_index()}.
 decode_amf3_object_traits(0, Data, Index, Acc) ->
     Return = lists:reverse(Acc),
     {Return, Data, Index};
@@ -416,9 +427,11 @@ decode_amf3_object_traits(Size, Data, Index0, Acc0) ->
             decode_amf3_object_traits(Size - 1, Rest1, Index1, Acc1)
     end.
 
+-spec decode_amf3_object_dynamics(Data :: binary(), Index :: amf3_index()) -> {#{binary() := term()}, binary(), amf3_index()}.
 decode_amf3_object_dynamics(Data, Index) ->
     decode_amf3_object_dynamics(Data, Index, #{}).
 
+-spec decode_amf3_object_dynamics(Data :: binary(), Index :: amf3_index(), Accumulator :: #{binary() := term()}) -> {#{binary() := term()}, binary(), amf3_index()}.
 decode_amf3_object_dynamics(<<16#0101:16/integer, Rest/binary>>, Index, Acc) ->
     {Acc, Rest, Index};
 

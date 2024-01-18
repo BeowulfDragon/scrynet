@@ -2,7 +2,7 @@
   description = "A livestreaming service?";
 
   inputs = {
-    nixpkgs.url = "nixpkgs/nixos-23.05";
+    nixpkgs.url = "nixpkgs/nixos-23.11";
   };
 
   outputs = { self, nixpkgs }:
@@ -17,7 +17,6 @@
           buildInputs = with pkgs; [
             erlang
             rebar3
-            ffmpeg_6 # replace with just ffmpeg when that becomes the default in nixpkgs (should be 23.11)
           ];
         };
       });

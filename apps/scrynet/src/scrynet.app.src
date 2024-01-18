@@ -5,7 +5,8 @@
   {mod, {scrynet_app, []}},
   {applications,
    [kernel,
-    stdlib
+    stdlib,
+    scrynet_rtmp
    ]},
   {env,[]},
   {modules, []},

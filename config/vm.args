@@ -2,5 +2,7 @@
 
 -setcookie scrynet_cookie
 
+-kernel logger_level debug
+
 +K true
 +A30

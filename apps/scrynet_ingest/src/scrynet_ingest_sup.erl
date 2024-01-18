@@ -17,7 +17,7 @@ init(_Args) ->
 
     ChildSpecifications = [
         #{
-            id => ,
+            id => bingus,
             start => {some_worker, start_link, []},
             restart => permanent, % permanent | transient | temporary
             shutdown => 2000,
